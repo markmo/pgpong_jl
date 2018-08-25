@@ -1,6 +1,6 @@
 #=
 main:
-- Julia version: 
+- Julia version:
 - Author: d777710
 - Date: 2018-08-23
 =#
@@ -16,15 +16,13 @@ gamma = 0.99          # discount factor for reward
 decay_rate = 0.99     # decay factor for RMSProp, leaky sum of grade^2
 resume = true         # flag to resume from previous checkpoint
 show = true
-model_path = "model.pkl"
+model_path = "model.hd5"
 
 # actions
 UP = 2
 DOWN = 3
 
 env = GymEnv("Pong-v0")
-
-train(init_model()...)
 
 function train(input_dim, model, grad_buffer, rmsprop_cache)
     # an image frame (a 210x160x3 byte array (integers from 0 to 255 giving pixel values)), 100,800 numbers total
@@ -34,12 +32,14 @@ function train(input_dim, model, grad_buffer, rmsprop_cache)
     running_reward = nothing
     reward_sum = 0
     episode_count = 0
-    while true:
-        if show:
+    while true
+        if show
             render(env)
         end
+
         # preprocess the observation, convert 210x160x3 byte array to a 80x80 float vector
         cur_x = preprocess(observation)
+        # println(size(cur_x))
 
         # set input to difference frame (i.e. subtraction of current and last frame) to detect motion
         x = prev_x == nothing ? zeros(input_dim) : cur_x - prev_x
@@ -50,13 +50,15 @@ function train(input_dim, model, grad_buffer, rmsprop_cache)
         action = choose_action(up_prob)  # roll the dice!
 
         # record various intermediates (needed for backprop)
-        append!(xs, x)  # observations
-        append!(hs, h)  # hidden states
+        push!(xs, x)  # observations
+        # println("h: ", size(h))
+        push!(hs, h)  # hidden states
+        # println("hs: ", size(hs))
         y = action == UP ? 1 : 0  # a "fake label"
 
         # grad that encourages the action that was taken to be taken
         # (see http://cs231n.github.io/neural-networks-2/#losses)
-        append!(dlogps, y - up_prob)  # grads
+        push!(dlogps, y - up_prob)  # grads
 
         # step the environment and get new observation
         # a +1 reward if the ball went past the opponent, a -1 reward if we missed the ball, or 0 otherwise
@@ -64,17 +66,27 @@ function train(input_dim, model, grad_buffer, rmsprop_cache)
         reward_sum += reward
 
         # record reward (must be done after call to `step` to get reward for previous action)
-        append!(rewards, reward)
+        push!(rewards, reward)
 
         if done  # an episode finished
             episode_count += 1
 
             # stack together all inputs, hidden states, action gradients,
             # and rewards for this episode
-            epx = vcat(xs)          # episode x
-            eph = vcat(hs)          # episode h
-            epdlogp = vcat(dlogps)  # episode gradient
-            epr = vcat(rewards)     # episode reward
+            # println("xs: ", size(xs))
+            epx = vcat(xs'...)          # episode x
+            # println("epx: ", size(epx))
+            # println("hs: ", size(hs))
+            eph = vcat(hs'...)          # episode h
+            # println("eph: ", size(eph))
+            # println("dlogps: ", size(dlogps))
+            epdlogp = vcat(dlogps'...)  # episode gradient
+            epdlogp = reshape(epdlogp, length(epdlogp), 1)
+            # println("epdlogp: ", size(epdlogp))
+            # println("rewards: ", size(rewards))
+            epr = vcat(rewards'...)     # episode reward
+            epr = reshape(epr, length(epr), 1)
+            # println("epr: ", size(epr))
             xs, hs, dlogps, rewards = [], [], [], []  # reset array memory
 
             # compute the discounted reward backwards through time
@@ -82,10 +94,12 @@ function train(input_dim, model, grad_buffer, rmsprop_cache)
 
             # standardize the rewards to be unit normal (helps control the gradient estimator variance)
             discounted_epr = normalize(discounted_epr)
+            # println("epdlogp: ", size(epdlogp))
+            # println("discounted_epr: ", size(discounted_epr))
 
-            epdlogp *= discounted_epr  # modulate the gradient with advantage (PG magic happens here!)
+            epdlogp = epdlogp .* discounted_epr  # modulate the gradient with advantage (PG magic happens here!)
             grad = policy_backward(model, eph, epx, epdlogp)
-            for k in model
+            for k in keys(model)
                 grad_buffer[k] += grad[k]  # accumulate grad over batch
             end
 
@@ -115,29 +129,49 @@ create_model(input_dim) = Dict(
     "W2" => randn(n_hidden) / sqrt(n_hidden)
 )
 
-sigmoid(x) = 1 / (1 + exp(-x))
+sigmoid(x) = 1. / (1. + exp(-x))
 
 function policy_forward(model, x)
-    h = model["W1"] * x    # compute hidden layer neuron activations
-    h[(h < 0)] = 0          # ReLU non-linearity
-    logp = model["W2"] * h  # compute log probability of going UP
-    p = sigmoid(logp)       # sigmoid "squashing" function to interval [0, 1]
-    p, h                    # return probability of going UP, and hidden state
+    # println("model[\"W1\"]: ", size(model["W1"]))
+    # println("x: ", size(x))
+    h = model["W1"] * x      # compute hidden layer neuron activations
+    # println("h: ", size(h))
+    h[h .< 0] = 0            # ReLU non-linearity
+    # println("model[\"W2\"]: ", size(model["W2"]))
+    # println("h: ", size(h))
+    logp = model["W2"]' * h  # compute log probability of going UP
+    # println("logp: ", size(logp))
+    p = sigmoid(logp)        # sigmoid "squashing" function to interval [0, 1]
+    # println("p: ", size(p))
+    p, h                     # return probability of going UP, and hidden state
 end
 
 function policy_backward(model, eph, epx, epdlogp)
-    dW2 = transpose(eph) * epdlogp
-    dh = epdlogp * model["W2"]
-    dh[(eph <= 0)] = 0      # backprop prelu
-    dW1 = transpose(dh) * epx
+    # println(">>> policy_backward")
+    # println("eph: ", size(eph))
+    # println("epdlogp: ", size(epdlogp))
+    dW2 = vec(eph' * epdlogp)
+    # println("dW2: ", size(dW2))
+    # println("epdlogp: ", size(epdlogp))
+    # println("model[\"W2\"]: ", size(model["W2"]))
+    dh = epdlogp .* model["W2"]'
+    # println("dh: ", size(dh))
+    dh[eph .<= 0] = 0        # backprop prelu
+    # println("dh: ", size(dh))
+    # println("epx: ", size(epx))
+    dW1 = dh' * epx
+    # println("dW1: ", size(dW1))
     Dict("W1" => dW1, "W2" => dW2)
 end
 
 update_parameters(model, grad_buffer, rmsprop_cache) =
     for (k, v) in model
         grad = grad_buffer[k]  # gradient
-        rmsprop_cache[k] = decay_rate * rmsprop_cache[k] + (1 - decay_rate) * grad^2
-        model[k] += learning_rate * grad / (sqrt(rmsprop_cache[k]) + 1e-5)
+        # println("decay_rate: ", size(decay_rate))
+        # println("rmsprop_cache[k]: ", size(rmsprop_cache[k]))
+        # println("grad: ", size(grad))
+        rmsprop_cache[k] = decay_rate * rmsprop_cache[k] + (1 - decay_rate) * grad.^2
+        model[k] += learning_rate * grad ./ (sqrt.(rmsprop_cache[k]) + 1e-5)
         grad_buffer[k] = zeros(size(v))  # reset batch gradient buffer
     end
 
@@ -145,7 +179,7 @@ function init_model()
     input_dim = 80 * 80
     if resume && isfile(model_path)
         model = load_model(model_path)
-    else:
+    else
         model = create_model(input_dim)
     end
     grad_buffer = Dict(k => zeros(size(v)) for (k, v) in model)
@@ -162,12 +196,17 @@ save_model(model, model_path) = h5open(model_path, "w") do file
 end
 
 """ Preprocess 210x160x3 uint8 frame into 6400 (80x80) 1D float vector """
-function preprocess(x):
-    x = x[36:196]       # crop
-    x = x[::2, ::2, 0]  # downsample by factor of 2
-    x[(x == 145)] = 0   # erase background (background type 1)
-    x[(x == 110)] = 0   # erase background (background type 2)
-    x[(x != 0)] = 1     # everything else (paddles, ball) just set to 1
+function preprocess(x)
+    # println(size(x))
+    x = x[36:195, :, :]         # crop
+    # println(size(x))
+    x = x[1:2:end, 1:2:end, 1]  # downsample by factor of 2
+    # println(size(x))
+    x[x .== 144] = 0            # erase background (background type 1)
+    # println(size(x))
+    x[x .== 109] = 0            # erase background (background type 2)
+    # println(size(x))
+    x[x .!= 0] = 1              # everything else (paddles, ball) just set to 1
     convert(Array{Float64, 1}, vec(x))
 end
 
@@ -192,4 +231,7 @@ function discount_rewards(rewards, gamma)
 end
 
 log_episode(reward_sum, running_reward) =
-    print("Resetting env episode reward total was $reward_sum. running mean: $running_reward")
+    @printf "Resetting env episode reward total was %f. running mean: %f\n" reward_sum running_reward
+
+
+train(init_model()...)
